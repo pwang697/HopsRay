@@ -1,0 +1,354 @@
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: rayjob-benchmark
+  namespace: ray-job
+spec:
+  # submissionMode specifies how RayJob submits the Ray job to the RayCluster.
+  # The default value is "K8sJobMode", meaning RayJob will submit the Ray job via a submitter Kubernetes Job.
+  # The alternative value is "HTTPMode", indicating that KubeRay will submit the Ray job by sending an HTTP request to the RayCluster.
+  # submissionMode: "K8sJobMode"
+  entrypoint: python /home/ray/scripts/python_code.py --framework xgboost --dataset ddos --disable-check
+  # shutdownAfterJobFinishes specifies whether the RayCluster should be deleted after the RayJob finishes. Default is false.
+  # shutdownAfterJobFinishes: false
+  # ttlSecondsAfterFinished specifies the number of seconds after which the RayCluster will be deleted after the RayJob finishes.
+  # ttlSecondsAfterFinished: 10
+  # activeDeadlineSeconds is the duration in seconds that the RayJob may be active before
+  # KubeRay actively tries to terminate the RayJob; value must be positive integer.
+  # activeDeadlineSeconds: 120
+  # RuntimeEnvYAML represents the runtime environment configuration provided as a multi-line YAML string.
+  # See https://docs.ray.io/en/latest/ray-core/handling-dependencies.html for details.
+  # (New in KubeRay version 1.0.)
+  runtimeEnvYAML: |
+    env_vars:
+      HADOOP_USER_NAME: "ray_job__meb10000"
+      LIBHDFS_DEFAULT_FS: "10.0.2.15:8020"
+      LIBHDFS_DEFAULT_USER: "ray_job__meb10000"
+      HADOOP_CONF_DIR: "/srv/hops/hadoop/etc/hadoop"
+      LIBHDFS_ROOT_CA_BUNDLE: "/srv/hops/certificates/ray_job__meb10000_root_ca.pem"
+      LIBHDFS_CLIENT_CERTIFICATE: "/srv/hops/certificates/ray_job__meb10000_certificate_bundle.pem"
+      LIBHDFS_CLIENT_KEY: "/srv/hops/certificates/ray_job__meb10000_private_key.pem"
+  #    LIBHDFS_ENABLE_LOG: "true"
+  # Suspend specifies whether the RayJob controller should create a RayCluster instance.
+  # If a job is applied with the suspend field set to true, the RayCluster will not be created and we will wait for the transition to false.
+  # If the RayCluster is already created, it will be deleted. In the case of transition to false, a new RayCluster will be created.
+  # suspend: false
+  # rayClusterSpec specifies the RayCluster instance to be created by the RayJob controller.
+  rayClusterSpec:
+    rayVersion: "2.23.0" # should match the Ray version in the image of the containers
+    # Ray head pod template
+    headGroupSpec:
+      # The `rayStartParams` are used to configure the `ray start` command.
+      # See https://github.com/ray-project/kuberay/blob/master/docs/guidance/rayStartParams.md for the default settings of `rayStartParams` in KubeRay.
+      # See https://docs.ray.io/en/latest/cluster/cli.html#ray-start for all available options in `rayStartParams`.
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+      #pod template
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: registry.service.consul:4443/ray-ml:2.23.0
+              ports:
+                - containerPort: 6379
+                  name: gcs-server
+                - containerPort: 8265 # Ray dashboard
+                  name: dashboard
+                - containerPort: 10001
+                  name: client
+              # Optimal resource allocation will depend on your Kubernetes infrastructure and might
+              # require some experimentation.
+              # Setting requests=limits is recommended with Ray. K8s limits are used for Ray-internal
+              # resource accounting. K8s requests are not used by Ray.
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: "8Gi"
+                requests:
+                  cpu: "1"
+                  memory: "8Gi"
+              volumeMounts:
+                - mountPath: /home/ray/scripts
+                  name: code
+                - mountPath: /srv/hops/certificates
+                  name: certs
+                - mountPath: /srv/hops/hadoop/etc/hadoop
+                  name: hadoop
+          volumes:
+            # You set volumes at the Pod level, then mount them into containers inside that Pod
+            - name: code
+              configMap:
+                # Provide the name of the ConfigMap you want to mount.
+                name: ray-job-code
+                # An array of keys from the ConfigMap to create as files
+                items:
+                  - key: python_code.py
+                    path: python_code.py
+            - name: certs
+              secret:
+                secretName: ray-job--meb10000
+            - name: hadoop
+              configMap:
+                name: ray-job-hadoopconf
+    workerGroupSpecs:
+      # the pod replicas in this group typed worker
+      - replicas: 3
+        minReplicas: 3
+        maxReplicas: 3
+        # logical group name, for this called small-group, also can be functional
+        groupName: small-group
+        # The `rayStartParams` are used to configure the `ray start` command.
+        # See https://github.com/ray-project/kuberay/blob/master/docs/guidance/rayStartParams.md for the default settings of `rayStartParams` in KubeRay.
+        # See https://docs.ray.io/en/latest/cluster/cli.html#ray-start for all available options in `rayStartParams`.
+        rayStartParams: {}
+        #pod template
+        template:
+          spec:
+            containers:
+              - name: ray-worker # must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character (e.g. 'my-name',  or '123-abc'
+                image: registry.service.consul:4443/ray-ml:2.23.0
+                lifecycle:
+                  preStop:
+                    exec:
+                      command: ["/bin/sh", "-c", "ray stop"]
+                # Optimal resource allocation will depend on your Kubernetes infrastructure and might
+                # require some experimentation.
+                # Setting requests=limits is recommended with Ray. K8s limits are used for Ray-internal
+                # resource accounting. K8s requests are not used by Ray.
+                resources:
+                  limits:
+                    cpu: "5"
+                    memory: "8Gi"
+                  requests:
+                    cpu: "5"
+                    memory: "8Gi"
+                # mount the volumes
+                volumeMounts:
+                  - mountPath: /srv/hops/certificates
+                    name: certs
+                  - mountPath: /srv/hops/hadoop/etc/hadoop
+                    name: hadoop
+            # here create the volumes as in the head
+            volumes:
+              # You set volumes at the Pod level, then mount them into containers inside that Pod
+              - name: certs
+                secret:
+                  secretName: ray-job--meb10000
+              - name: hadoop
+                configMap:
+                  name: ray-job-hadoopconf
+  # SubmitterPodTemplate is the template for the pod that will run the `ray job submit` command against the RayCluster.
+  # If SubmitterPodTemplate is specified, the first container is assumed to be the submitter container.
+  # submitterPodTemplate:
+  #   spec:
+  #     restartPolicy: Never
+  #     containers:
+  #       - name: my-custom-rayjob-submitter-pod
+  #         image: rayproject/ray:2.12.0
+  #         # If Command is not specified, the correct command will be supplied at runtime using the RayJob spec `entrypoint` field.
+  #         # Specifying Command is not recommended.
+  #         # command: ["sh", "-c", "ray job submit --address=http://$RAY_DASHBOARD_ADDRESS --submission-id=$RAY_JOB_SUBMISSION_ID -- echo hello world"]
+######################Ray code sample#################################
+# this sample is from https://docs.ray.io/en/latest/cluster/job-submission.html#quick-start-example
+# it is mounted into the container and executed to show the Ray job at work
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-job-code
+  namespace: ray-job
+data:
+  python_code.py: |
+    import json
+    import numpy as np
+    import os
+    import pandas as pd
+    import time
+    from typing import Dict
+
+    import xgboost as xgb
+
+    import ray
+    from ray import data
+    from ray.train.lightgbm import LightGBMTrainer
+    from ray.train.xgboost import XGBoostTrainer
+    from ray.train import RunConfig, ScalingConfig
+
+    _TRAINING_TIME_THRESHOLD = 600
+    _PREDICTION_TIME_THRESHOLD = 450
+
+    _EXPERIMENT_PARAMS = {
+        "ddos": {
+            "data": "/Projects/ray_job/Resources/ddos_benchmark.parquet",
+            "num_workers": 3,
+            "cpus_per_worker": 4,
+        },
+    }
+
+
+    class BasePredictor:
+        def __init__(self, trainer_cls, result: ray.train.Result):
+            self.model = trainer_cls.get_model(result.checkpoint)
+
+        def __call__(self, data):
+            raise NotImplementedError
+
+
+    class XGBoostPredictor(BasePredictor):
+        def __call__(self, data: pd.DataFrame) -> Dict[str, np.ndarray]:
+            dmatrix = xgb.DMatrix(data)
+            return {"predictions": self.model.predict(dmatrix)}
+
+
+    class LightGBMPredictor(BasePredictor):
+        def __call__(self, data: pd.DataFrame) -> Dict[str, np.ndarray]:
+            return {"predictions": self.model.predict(data)}
+
+
+    _FRAMEWORK_PARAMS = {
+        "xgboost": {
+            "trainer_cls": XGBoostTrainer,
+            "predictor_cls": XGBoostPredictor,
+            "params": {
+                "objective": "binary:logistic",
+                "eval_metric": ["logloss", "error"],
+            },
+        },
+        "lightgbm": {
+            "trainer_cls": LightGBMTrainer,
+            "predictor_cls": LightGBMPredictor,
+            "params": {
+                "objective": "binary",
+                "metric": ["binary_logloss", "binary_error"],
+            },
+        },
+    }
+
+
+    def train(
+        framework: str, data_path: str, num_workers: int, cpus_per_worker: int
+    ) -> ray.train.Result:
+        import fsspec
+        import pyarrow.fs
+        from pydoopfsspec import HadoopFileSystem
+        fsspec.register_implementation("pydoop", HadoopFileSystem)
+        hdfs = fsspec.filesystem("pydoop")
+        fs = pyarrow.fs.PyFileSystem(pyarrow.fs.FSSpecHandler(hdfs))
+
+        ds = data.read_parquet(data_path, filesystem=fs)
+        framework_params = _FRAMEWORK_PARAMS[framework]
+
+        trainer_cls = framework_params["trainer_cls"]
+
+        trainer = trainer_cls(
+            params=framework_params["params"],
+            scaling_config=ScalingConfig(
+                num_workers=num_workers,
+                resources_per_worker={"CPU": cpus_per_worker},
+                trainer_resources={"CPU": 0},
+            ),
+            label_column="Label",
+            datasets={"train": ds},
+            run_config=RunConfig(
+                storage_filesystem=fs,
+                storage_path="/Projects/ray_job/Resources",
+                name=f"{framework}_benchmark",
+
+            ),
+        )
+        result = trainer.fit()
+        return result
+
+
+    def predict(framework: str, result: ray.train.Result, data_path: str):
+        framework_params = _FRAMEWORK_PARAMS[framework]
+
+        predictor_cls = framework_params["predictor_cls"]
+
+        import fsspec
+        import pyarrow.fs
+        from pydoopfsspec import HadoopFileSystem
+        fsspec.register_implementation("pydoop", HadoopFileSystem)
+        hdfs = fsspec.filesystem("pydoop")
+        fs = pyarrow.fs.PyFileSystem(pyarrow.fs.FSSpecHandler(hdfs))
+
+        ds = data.read_parquet(data_path, filesystem=fs)
+        ds = ds.drop_columns(["Label"])
+
+        concurrency = int(ray.cluster_resources()["CPU"] // 2)
+        result = ds.map_batches(
+            predictor_cls,
+            # Improve prediction throughput with larger batch size than default 4096
+            batch_size=2048,
+            concurrency=concurrency,
+            fn_constructor_kwargs={
+                "trainer_cls": framework_params["trainer_cls"],
+                "result": result,
+            },
+            batch_format="pandas",
+        )
+
+        for _ in result.iter_batches():
+            pass
+
+
+    def main(args):
+        framework = args.framework
+
+        experiment_params = _EXPERIMENT_PARAMS[args.dataset]
+
+        data_path, num_workers, cpus_per_worker = (
+            experiment_params["data"],
+            experiment_params["num_workers"],
+            experiment_params["cpus_per_worker"],
+        )
+
+        print(f"Running {framework} training benchmark...")
+        training_start = time.perf_counter()
+        result = train(framework, data_path, num_workers, cpus_per_worker)
+        training_time = time.perf_counter() - training_start
+
+        print(f"Running {framework} prediction benchmark...")
+        prediction_start = time.perf_counter()
+        predict(framework, result, data_path)
+        prediction_time = time.perf_counter() - prediction_start
+
+        times = {"training_time": training_time, "prediction_time": prediction_time}
+        print("Training result:\n", result)
+        print("Training/prediction times:", times)
+        test_output_json = os.environ.get("TEST_OUTPUT_JSON", "/tmp/result.json")
+        with open(test_output_json, "wt") as f:
+            json.dump(times, f)
+
+        if not args.disable_check:
+            if training_time > _TRAINING_TIME_THRESHOLD:
+                raise RuntimeError(
+                    f"Training is taking {training_time} seconds, "
+                    f"which is longer than expected ({_TRAINING_TIME_THRESHOLD} seconds)."
+                )
+
+            if prediction_time > _PREDICTION_TIME_THRESHOLD:
+                raise RuntimeError(
+                    f"Batch prediction is taking {prediction_time} seconds, "
+                    f"which is longer than expected ({_PREDICTION_TIME_THRESHOLD} seconds)."
+                )
+
+
+    if __name__ == "__main__":
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            "--framework", type=str, choices=["xgboost", "lightgbm"], default="xgboost"
+        )
+        parser.add_argument("--dataset", type=str, choices=["ddos"], default="ddos")
+        # Add a flag for disabling the timeout error.
+        # Use case: running the benchmark as a documented example, in infra settings
+        # different from the formal benchmark's EC2 setup.
+        parser.add_argument(
+            "--disable-check",
+            action="store_true",
+            help="disable runtime error on benchmark timeout",
+        )
+        args = parser.parse_args()
+        main(args)
